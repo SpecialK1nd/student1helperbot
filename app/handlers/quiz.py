@@ -77,4 +77,103 @@ async def cmd_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # До сюда в текущей реализации не дойдем (вопросы идут через роутер).
     # Оставлено как пояснение для расширения.
     _ = correct
+async def on_text_quiz_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Роутер, который ловит обычные текстовые сообщения, когда пользователь в режиме викторины.
+    Держит очередь вопросов в user_data и по одному задает следующий.
+    """
+
+    if not update.message or not update.message.text:
+        return
+
+    # Если пользователь не в режиме викторины — игнорируем.
+    if not context.user_data.get("quiz_waiting"):
+        return
+
+    text = update.message.text.strip()
+    if text.lower() in {"стоп", "stop", "cancel"}:
+        # Сбрасываем состояние.
+        context.user_data.pop("quiz_waiting", None)
+        context.user_data.pop("quiz_queue", None)
+        context.user_data.pop("quiz_score", None)
+        context.user_data.pop("quiz_total", None)
+        context.user_data.pop("quiz_topic", None)
+        await update.message.reply_text("Ок, остановил викторину.")
+        return
+
+    # Восстановим текущий вопрос из очереди:
+    queue = context.user_data.get("quiz_queue") or []
+    if not queue:
+        # Нечего обрабатывать — сбрасываем.
+        context.user_data.pop("quiz_waiting", None)
+        await update.message.reply_text("Похоже, викторина уже завершена. Запусти заново: /quiz <тема>")
+        return
+
+    current = queue[0]
+    answers = set(a.lower() for a in current.get("answers", []))
+
+    # Инициализируем счетчики, если их еще нет:
+    if "quiz_score" not in context.user_data:
+        context.user_data["quiz_score"] = 0
+    if "quiz_total" not in context.user_data:
+        context.user_data["quiz_total"] = len(queue)
+
+    # Проверка ответа:
+    from app.services.quiz_bank import QuizQuestion  # локальный импорт, чтобы файл был самостоятельным
+    q_obj = QuizQuestion(question=current.get("question", ""), answers=answers)
+
+    is_ok = check_answer(q_obj, text)
+    if is_ok:
+        context.user_data["quiz_score"] += 1
+        await update.message.reply_text("Верно ✅")
+    else:
+        # Покажем 1 “эталонный” ответ, чтобы не спамить списком.
+        example = next(iter(answers)) if answers else "—"
+        await update.message.reply_text(f"Не совсем ❌ Пример правильного ответа: {example}")
+
+    # Убираем текущий вопрос из очереди:
+    queue.pop(0)
+    context.user_data["quiz_queue"] = queue
+
+    # Если вопросы закончились — подводим итог и пишем статистику:
+    if not queue:
+        score = int(context.user_data.get("quiz_score", 0))
+        total = int(context.user_data.get("quiz_total", 0))
+        topic = str(context.user_data.get("quiz_topic", "")) or None
+
+        user_id = int(update.effective_user.id) if update.effective_user else 0
+
+        upsert_quiz_stats(
+            context.application.bot_data["db_path"],
+            user_id=user_id,
+            quizzes_add=1,
+            questions_add=total,
+            correct_add=score,
+            last_topic=topic,
+        )
+
+        percent = round((score / total) * 100, 1) if total else 0.0
+        await update.message.reply_text(
+            join_lines(
+                [
+                    "Викторина завершена!",
+                    f"Результат: {score}/{total} ({percent}%)",
+                    "Статистика обновлена. Посмотри: /stats",
+                ]
+            )
+        )
+
+        # Сбрасываем состояние:
+        context.user_data.pop("quiz_waiting", None)
+        context.user_data.pop("quiz_queue", None)
+        context.user_data.pop("quiz_score", None)
+        context.user_data.pop("quiz_total", None)
+        context.user_data.pop("quiz_topic", None)
+        return
+
+    # Иначе задаем следующий вопрос:
+    next_q = queue[0]
+    idx_done = int(context.user_data.get("quiz_total", 0)) - len(queue)
+    total = int(context.user_data.get("quiz_total", 0))
+    await update.message.reply_text(f"Вопрос {idx_done + 1}/{total}: {next_q.get('question', '')}")
 
